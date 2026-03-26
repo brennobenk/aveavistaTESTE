@@ -4592,8 +4592,8 @@ async function openPublicProfile(handle) {
     const [obsR, spR, folR, folwR, daysR] = await Promise.all([
       db.from('observations').select('id', { count: 'exact', head: true }).eq('user_id', profile.id),
       db.from('species_seen').select('id', { count: 'exact', head: true }).eq('user_id', profile.id),
-      db.from('follows').select('id', { count: 'exact', head: true }).eq('following_id', profile.id),
-      db.from('follows').select('id', { count: 'exact', head: true }).eq('follower_id', profile.id),
+      db.from('follows').select('follower_id', { count: 'exact', head: true }).eq('following_id', profile.id),
+      db.from('follows').select('follower_id', { count: 'exact', head: true }).eq('follower_id', profile.id),
       db.from('observations').select('obs_date').eq('user_id', profile.id).not('obs_date','is',null)
     ]);
     document.getElementById('pub-stat-followers').textContent = folR.count ?? 0;
@@ -4723,7 +4723,7 @@ async function pubToggleFollow(btn) {
       btn.style.border = '1.5px solid var(--border)';
       try { await db.from('notifications').insert({ user_id: targetId, type: 'follow', actor_id: currentUser.id, data: { actor_handle: currentUser.handle, actor_name: currentUser.name } }); } catch(e) {}
     }
-    const { count } = await db.from('follows').select('id', { count: 'exact', head: true }).eq('following_id', targetId);
+    const { count } = await db.from('follows').select('follower_id', { count: 'exact', head: true }).eq('following_id', targetId);
     const el = document.getElementById('pub-stat-followers');
     if (el) el.textContent = count ?? 0;
   } catch(e) { showToast('❌ Erro: ' + e.message); }
@@ -4769,7 +4769,7 @@ function startRealtimeSubscriptions() {
       event: '*', schema: 'public', table: 'follows',
       filter: `following_id=eq.${currentUser.id}`
     }, async () => {
-      const { count } = await db.from('follows').select('id', { count: 'exact', head: true }).eq('following_id', currentUser.id);
+      const { count } = await db.from('follows').select('follower_id', { count: 'exact', head: true }).eq('following_id', currentUser.id);
       const fEl = document.getElementById('stat-followers');
       if (fEl) fEl.textContent = count ?? 0;
     })
@@ -4821,7 +4821,7 @@ async function loadUserStats(userId, handle) {
     const [obsR, spR, folR] = await Promise.all([
       db.from('observations').select('id', { count:'exact', head:true }).eq('user_id', userId),
       db.from('species_seen').select('id',  { count:'exact', head:true }).eq('user_id', userId),
-      db.from('follows').select('id',       { count:'exact', head:true }).eq('following_id', userId)
+      db.from('follows').select('follower_id',       { count:'exact', head:true }).eq('following_id', userId)
     ]);
     const s = document.getElementById('usp_'+handle);
     const o = document.getElementById('uob_'+handle);
@@ -4922,7 +4922,7 @@ async function toggleFollowUser(targetId, handle, btn) {
         });
       } catch(e) {}
     }
-    const { count } = await db.from('follows').select('id', { count: 'exact', head: true }).eq('following_id', targetId);
+    const { count } = await db.from('follows').select('follower_id', { count: 'exact', head: true }).eq('following_id', targetId);
     const folEl = document.getElementById('ufo_'+handle);
     if (folEl) folEl.textContent = count ?? 0;
     const ppFol = document.getElementById('pp-fol');
