@@ -23,6 +23,75 @@ async function carregarDescricoes() {
 }
 carregarDescricoes();
 
+/* ════════════════════════════════════════
+   GUARDS PARA EVITAR MÚLTIPLAS CHAMADAS SIMULTÂNEAS
+════════════════════════════════════════ */
+const _renderGuards = {};
+async function withGuard(key, fn) {
+  if (_renderGuards[key]) return;
+  _renderGuards[key] = true;
+  try { await fn(); } finally { _renderGuards[key] = false; }
+}
+
+/* Cache de requisições com TTL de 30s */
+const _reqCache = {};
+async function cachedFetch(key, fn, ttl = 30000) {
+  const now = Date.now();
+  if (_reqCache[key] && (now - _reqCache[key].ts) < ttl) return _reqCache[key].data;
+  const data = await fn();
+  _reqCache[key] = { data, ts: now };
+  return data;
+}
+function invalidateCache(prefix) {
+  Object.keys(_reqCache).forEach(k => { if (k.startsWith(prefix)) delete _reqCache[k]; });
+}
+
+/* ════════════════════════════════════════
+   RARIDADE DAS ESPÉCIES
+   Fonte: raridade.txt do repositório
+════════════════════════════════════════ */
+const MUITO_RARAS = new Set([
+  "Urubitinga coronata","Thalassarche chlororhynchos","Diomedea dabbenena",
+  "Diomedea exulans","Touit melanonotus","Pteroglossus castanotis",
+  "Limnoctites rectirostris","Phylloscartes eximius","Formicivora acutirostris",
+  "Sporophila cinnamomea","Cistothorus platensis","Sporophila angolensis",
+  "Rhea americana","Spizaetus ornatus","Pterodroma incerta","Eudocimus ruber",
+  "Aburria jacutinga","Primolius maracana","Onychorhynchus swainsoni",
+  "Polystictus pectoralis","Culicivora caudacuta","Amazona vinacea",
+  "Heliornis fulica","Tigrisoma fasciatum","Scytalopus iraiensis",
+  "Accipiter poliogaster","Xanthopsar flavus"
+]);
+
+const RARAS = new Set([
+  "Pandion haliaetus","Thalassarche chrysostoma","Thalassarche melanophris",
+  "Myiobius barbatus","Sporophila palustris","Anthus nattereri","Piprites pileata",
+  "Sporophila falcirostris","Strix huhula","Hydropsalis anomala",
+  "Corythopis delalandi","Phylloscartes difficilis","Spizaetus melanoleucus",
+  "Amadonastur lacernulatus","Crypturellus noctivagus","Calidris subruficollis",
+  "Limnodromus griseus","Calidris pusilla","Stercorarius parasiticus",
+  "Hemitriccus kaempferi","Phylloscartes sylviolus","Chloroceryle inda",
+  "Heteroxolmis dominicanus","Hemitriccus diops","Myrmoderus squamosus",
+  "Amazona pretrei","Biatas nigropectus","Procellaria conspicillata",
+  "Procellaria aequinoctialis","Sporophila beltoni","Platyrinchus leucoryphus",
+  "Pyroderus scutatus","Celeus galeatus","Drymophila squamata",
+  "Sporophila frontalis","Stilpnia peruviana","Laterallus spilopterus",
+  "Trogon viridis","Scytalopus pachecoi","Phibalura flavirostris",
+  "Loriotus cristatus","Cissopis leverianus","Thalasseus maximus",
+  "Lipaugus lanioides"
+]);
+
+function getRaridade(sci) {
+  if (MUITO_RARAS.has(sci)) return 'muito-rara';
+  if (RARAS.has(sci)) return 'rara';
+  return 'comum';
+}
+
+/* Opera GX / navegadores Chromium: fix para supabase UMD */
+if (typeof window !== 'undefined' && !window._supabaseReady) {
+  window._supabaseReady = true;
+}
+
+
 function obterDescricaoAve(sci) {
   if (!descricoesAves || Object.keys(descricoesAves).length === 0) return null;
   const key = (sci || "").toLowerCase().trim();
@@ -32,6 +101,10 @@ function obterDescricaoAve(sci) {
 async function loadLocalDescription(sci, pop) {
   const el = document.getElementById('bird-local-desc');
   if (!el) return;
+  // Se descrições ainda não carregaram, aguarda até 3s
+  if (!descricoesAves || Object.keys(descricoesAves).length === 0) {
+    await carregarDescricoes();
+  }
   const desc = obterDescricaoAve(sci);
   if (desc) {
     el.textContent = desc;
@@ -1492,6 +1565,7 @@ db.auth.onAuthStateChange(async (event, session) => {
       updateSidebarAuth();
       renderProfile();
       loadUserChecklist();
+      if (event === 'SIGNED_IN') showLoginAnimation(profile.nome || profile.handle || '');
       loadNotifBadge();
       loadMsgBadge(); // <-- adicionar aqui
       startNotifRealtime();
@@ -1563,7 +1637,10 @@ function navigateTo(pageId, btn) {
     if (sidebar) sidebar.classList.remove('expanded');
     if (layout) layout.classList.remove('sidebar-expanded');
   }
-  if (pageId === 'feed')    renderFeed('full-feed', 12);
+  if (pageId === 'feed') {
+    _feedOffset = 0; _feedHasMore = true; _feedLoading = false;
+    renderFeed('full-feed', _FEED_PAGE_SIZE).then(() => setupFeedInfiniteScroll('full-feed'));
+  }
   if (pageId === 'profile') renderProfile();
   if (pageId === 'users')   renderUsers('');
   if (pageId === 'ranking') loadRanking();
@@ -1611,7 +1688,15 @@ function getTodayBird() {
       if (parsed.date === today) return parsed.bird;
     } catch(e) {}
   }
-  const seed = today.replace(/-/g, '').split('').reduce((a, c) => a + c.charCodeAt(0), 0);
+  // Hash mais distribuído para evitar sequência previsível
+  let seed = 0;
+  const dateStr = today.replace(/-/g, '');
+  for (let i = 0; i < dateStr.length; i++) {
+    seed = (seed * 31 + dateStr.charCodeAt(i)) >>> 0;
+  }
+  seed = ((seed ^ (seed >>> 16)) * 0x45d9f3b) >>> 0;
+  seed = ((seed ^ (seed >>> 16)) * 0x45d9f3b) >>> 0;
+  seed = (seed ^ (seed >>> 16)) >>> 0;
   const bird = SC_BIRDS[seed % SC_BIRDS.length];
   sessionStorage.setItem('av_bird_day', JSON.stringify({ date: today, bird }));
   return bird;
@@ -1649,60 +1734,76 @@ async function loadBirdPhoto(sciName, popName) {
   const loading = document.getElementById('bird-img-loading');
   const badge   = document.getElementById('bird-inat-badge');
 
+  // Garante estado inicial: loading visível, img oculta
+  if (img)     { img.style.display = 'none'; img.src = ''; }
+  if (loading) loading.style.display = 'flex';
+  if (badge)   badge.style.display = 'none';
+
   try {
     const idx = await ensurePhotoIndex();
-    const key     = sciName.toLowerCase().trim();
+    const key     = (sciName || '').toLowerCase().trim();
     const entries = idx[key];
     if (entries && entries.length > 0) {
       const entry = entries[Math.floor(Math.random() * entries.length)];
-      img.src = entry.url;
-      img.alt = popName;
-      badge.style.display = 'flex';
-      if (entry.profileUrl) {
-        badge.innerHTML = `📸 Foto por: <a href="${entry.profileUrl}" target="_blank" style="color:white;text-decoration:underline;margin-left:4px;">${entry.author}</a>`;
-      } else {
-        badge.innerHTML = `📸 Foto por: ${entry.author}`;
-      }
-      badge.onclick = null;
-      document.getElementById('btn-inat').onclick = () => window.open(`https://www.inaturalist.org/taxa?q=${encodeURIComponent(sciName)}`, '_blank');
+      // Pré-carrega a imagem antes de exibir
+      const testImg = new Image();
+      testImg.onload = () => {
+        img.src = entry.url;
+        img.alt = popName;
+        img.style.display = 'block';
+        if (loading) loading.style.display = 'none';
+        if (badge) {
+          badge.style.display = 'flex';
+          if (entry.profileUrl) {
+            badge.innerHTML = `📸 Foto por: <a href="${entry.profileUrl}" target="_blank" style="color:white;text-decoration:underline;margin-left:4px;">${entry.author}</a>`;
+          } else {
+            badge.innerHTML = `📸 Foto por: ${entry.author}`;
+          }
+        }
+        document.getElementById('btn-inat').onclick = () => window.open(`https://www.inaturalist.org/taxa?q=${encodeURIComponent(sciName)}`, '_blank');
+      };
+      testImg.onerror = () => showNoBirdPhoto(loading, popName);
+      testImg.src = entry.url;
       return;
     }
   } catch(e) {
-    console.warn('photo_index.json não disponível, tentando iNaturalist…', e);
+    console.warn('photo_index.json indisponível:', e);
   }
 
+  // Fallback: iNaturalist direto (suporta CORS nativamente)
   try {
-    const url  = `https://api.inaturalist.org/v1/taxa?q=${encodeURIComponent(sciName)}&rank=species&per_page=1`;
-    const res  = await fetch(url);
+    const inatUrl = `https://api.inaturalist.org/v1/taxa?q=${encodeURIComponent(sciName)}&rank=species&per_page=1`;
+    const res  = await fetch(inatUrl);
     const data = await res.json();
-    if (data.results && data.results[0] && data.results[0].default_photo) {
+    if (data.results?.[0]?.default_photo) {
       const photo  = data.results[0].default_photo;
       const inatId = data.results[0].id;
+      const attr = photo.attribution || '';
+      const m = attr.match(/\(c\)\s*([^,]+)/i);
+      const authorName = m ? m[1].trim() : 'iNaturalist';
       img.src = photo.medium_url;
       img.alt = popName;
-      badge.style.display = 'flex';
-      let authorName = '';
-      let licenseText = '';
-      if (photo.attribution) {
-        const match = photo.attribution.match(/\(c\)\s*([^,]+)/i);
-        if (match) authorName = match[1].trim();
-        const licMatch = photo.attribution.match(/\((CC[^)]+|public domain)\)/i);
-        if (licMatch) licenseText = licMatch[1];
+      img.style.display = 'block';
+      if (loading) loading.style.display = 'none';
+      if (badge) {
+        badge.style.display = 'flex';
+        badge.innerHTML = `🌿 <a href="https://www.inaturalist.org/taxa/${inatId}" target="_blank" style="color:white;text-decoration:underline;margin-left:4px;">${authorName} · iNaturalist ↗</a>`;
       }
-      const authorHtml = authorName
-        ? `<a href="https://www.inaturalist.org/taxa/${inatId}" target="_blank" style="color:white;text-decoration:underline;margin-left:4px;">${authorName}</a>`
-        : `<a href="https://www.inaturalist.org/taxa/${inatId}" target="_blank" style="color:white;text-decoration:underline;margin-left:4px;">iNaturalist</a>`;
-      badge.innerHTML = `🌿 Foto por: ${authorHtml}${licenseText ? ` <span style="opacity:.7;font-size:10px;margin-left:4px;">${licenseText}</span>` : ''}`;
-      badge.onclick = null;
       document.getElementById('btn-inat').onclick = () => window.open(`https://www.inaturalist.org/taxa/${inatId}`, '_blank');
       return;
     }
-  } catch(e) {
-    console.warn('iNaturalist também indisponível:', e);
-  }
+  } catch(e) { console.warn('[inat fallback] erro:', e?.message); }
 
-  loading.querySelector('.bird-emoji-big').textContent = getSpeciesEmoji(popName);
-  loading.querySelector('span').textContent = 'Sem foto disponível';
+  showNoBirdPhoto(loading, popName);
+}
+
+function showNoBirdPhoto(loading, popName) {
+  if (!loading) return;
+  loading.style.display = 'flex';
+  const emojiEl = loading.querySelector('.bird-emoji-big');
+  const spanEl  = loading.querySelector('span');
+  if (emojiEl) emojiEl.textContent = getSpeciesEmoji(popName);
+  if (spanEl)  spanEl.textContent  = 'Sem foto disponível';
 }
 
 function openInat() {
@@ -1799,14 +1900,19 @@ function escHtml(s) {
 async function renderFeed(containerId, limit) {
   const container = document.getElementById(containerId);
   if (!container) return;
+  if (_renderGuards['feed_' + containerId]) return;
+  _renderGuards['feed_' + containerId] = true;
+  // Release guard on scroll/outside calls after 8s max
+  const _feedGuardTimer = setTimeout(() => { _renderGuards['feed_' + containerId] = false; }, 8000);
   container.innerHTML = `<div style="grid-column:1/-1;text-align:center;padding:32px;color:var(--text-muted);">
     <div style="font-size:32px;margin-bottom:8px;">🔭</div><div>Carregando avistamentos…</div>
   </div>`;
 
   try {
+    // Busca sem join de profiles para evitar ambiguidade de FK
     const { data, error } = await db
       .from('observations')
-      .select('*, profiles(nome, handle, avatar_url)')
+      .select('id, user_id, species_pop, species_sci, obs_date, location_label, notes, photo_url, companion_handle, published_inat')
       .order('created_at', { ascending: false })
       .limit(limit);
 
@@ -1828,30 +1934,56 @@ async function renderFeed(containerId, limit) {
       return;
     }
 
-    const allObs = data.map(o => ({
-      id: o.id,
-      species:  o.species_pop || o.species_sci,
-      sciName:  o.species_sci,
-      date:     o.obs_date,
-      location: o.location_label || '',
-      notes:    o.notes || '',
-      photoUrl: o.photo_url || null,
-      user: {
-        name:   o.profiles?.nome   || o.profiles?.handle || 'Usuário',
-        handle: o.profiles?.handle || ''
-      }
-    }));
+    // Busca perfis dos autores em lote (sem join ambíguo)
+    const userIds = [...new Set((data || []).map(o => o.user_id).filter(Boolean))];
+    let profilesMap = {};
+    if (userIds.length) {
+      const { data: profData } = await db.from('profiles')
+        .select('id, nome, handle, avatar_url')
+        .in('id', userIds);
+      (profData || []).forEach(p => { profilesMap[p.id] = p; });
+    }
+
+    const allObs = (data || []).map(o => {
+      const prof = profilesMap[o.user_id] || {};
+      return {
+        id: o.id,
+        species:  o.species_pop || o.species_sci,
+        sciName:  o.species_sci,
+        date:     o.obs_date,
+        location: o.location_label || '',
+        notes:    o.notes || '',
+        photoUrl: o.photo_url || null,
+        user: {
+          name:   prof.nome   || prof.handle || 'Usuário',
+          handle: prof.handle || ''
+        },
+        companionHandle: o.companion_handle || null,
+        companionName:   null,
+      };
+    });
 
     container.innerHTML = allObs.map((obs) => {
       const userName   = obs.user?.name   || 'Usuário';
       const userHandle = obs.user?.handle || '';
       const hasPhoto   = obs.photoUrl;
       const obsId      = obs.id;
+      const raridade   = getRaridade(obs.sciName || '');
+      let cardBorder = '';
+      let cardClass  = 'obs-card';
+      if (raridade === 'muito-rara') { cardClass += ' obs-card-muito-rara'; }
+      else if (raridade === 'rara') { cardClass += ' obs-card-rara'; }
+      else { cardClass += ' obs-card-comum'; }
+
+      const safeObsJson = JSON.stringify(obs).replace(/"/g,'&quot;');
       return `
-      <div class="obs-card">
-        <div class="obs-card-img" style="cursor:${hasPhoto?'pointer':'default'};" onclick="${hasPhoto?`openPhotoExpand(${JSON.stringify(obs).replace(/"/g,'&quot;')})`:''}">
-          ${hasPhoto ? `<img src="${obs.photoUrl}" alt="${obs.species||''}" onerror="this.parentElement.innerHTML='<div class=no-img-emoji>🐦</div>'">` : `<div class="no-img-emoji">${getSpeciesEmoji(obs.species||'')}</div>`}
+      <div class="${cardClass}" style="transform-style:preserve-3d;will-change:transform;"
+        onmousemove="obs3dTilt(this,event)"
+        onmouseleave="obs3dReset(this)">
+        <div class="obs-card-img" style="cursor:${hasPhoto?'pointer':'default'};" onclick="${hasPhoto?`openPhotoExpand(${safeObsJson})`:''}">
+          ${hasPhoto ? `<img src="${obs.photoUrl}" alt="${escHtml(obs.species||'')}" loading="lazy" onerror="this.parentElement.innerHTML='<div class=no-img-emoji>🐦</div>'">` : `<div class="no-img-emoji">${getSpeciesEmoji(obs.species||'')}</div>`}
           ${hasPhoto ? `<div style="position:absolute;inset:0;background:linear-gradient(transparent 60%,rgba(0,0,0,0.3));border-radius:inherit;pointer-events:none;"></div>` : ''}
+          ${raridade !== 'comum' ? `<div class="raridade-badge raridade-${raridade}">${raridade === 'muito-rara' ? '🔴 Muito Rara' : '🟡 Rara'}</div>` : ''}
         </div>
         <div class="obs-card-body">
           <div class="obs-card-user">
@@ -1859,15 +1991,19 @@ async function renderFeed(containerId, limit) {
             <span class="obs-username" style="${userHandle?'cursor:pointer;color:var(--sky);':''}" onclick="${userHandle?'event.stopPropagation();openPublicProfile(\''+escHtml(userHandle)+'\')':''}">${escHtml(userName||'Usuário')}</span>
             <span class="obs-date">${formatDate(obs.date||'')}</span>
           </div>
-          <div class="obs-species">${escHtml(capitalize(obs.species||obs.sciName||''))}</div>
-          <div class="obs-sci">${escHtml(obs.sciName||'')}</div>
+          <div class="obs-species" style="cursor:pointer;" onclick="event.stopPropagation();openSpeciesModal('${escHtml(obs.sciName||'')}','${escHtml(obs.species||obs.sciName||'')}')">${escHtml(capitalize(obs.species||obs.sciName||''))}</div>
+          <div class="obs-sci" style="cursor:pointer;font-style:italic;" onclick="event.stopPropagation();openSpeciesModal('${escHtml(obs.sciName||'')}','${escHtml(obs.species||obs.sciName||'')}')">${escHtml(obs.sciName||'')}</div>
+          ${obs.companionHandle ? `<div style="font-size:11px;color:var(--text-muted);margin-top:2px;">` +
+            `📸 <span onclick="event.stopPropagation();openPublicProfile('${escHtml(obs.user?.handle||'')}');" style="color:var(--sky);cursor:pointer;">@${escHtml(obs.user?.handle||'')}</span>` +
+            ` e <span onclick="event.stopPropagation();openPublicProfile('${escHtml(obs.companionHandle||'')}');" style="color:var(--sky);cursor:pointer;">@${escHtml(obs.companionHandle||'')}</span>` +
+            `</div>` : ''}
           ${obs.location ? `<div class="obs-location">📍 ${escHtml(obs.location)}</div>` : ''}
         </div>
         <div class="obs-card-footer">
           <button class="obs-action-btn" id="like-btn-${obsId}" onclick="toggleLike('${obsId}',this)">
-            <span id="like-icon-${obsId}">🤍</span> <span id="like-count-${obsId}"></span>
+            <span id="like-icon-${obsId}">🤍</span> <span id="like-count-${obsId}">0</span>
           </button>
-          <button class="obs-action-btn" id="comment-btn-${obsId}" onclick="openCommentModal('${obsId}', '${capitalize(obs.species||obs.sciName||'')}')">💬 <span id="comment-count-${obsId}"></span></button>
+          <button class="obs-action-btn" id="comment-btn-${obsId}" onclick="openCommentModal('${obsId}', '${capitalize(obs.species||obs.sciName||'')}')">💬 <span id="comment-count-${obsId}">0</span></button>
           ${obs.inatId ? `<button class="obs-action-btn" onclick="window.open('https://www.inaturalist.org/observations/${obs.inatId}','_blank')">🌿 iNat</button>` : ''}
         </div>
       </div>`;
@@ -1882,6 +2018,139 @@ async function renderFeed(containerId, limit) {
 }
 
 /* ════════════════════════════════════════
+   EFEITO 3D RELUZENTE NOS CARDS
+════════════════════════════════════════ */
+function obs3dTilt(el, e) {
+  const rect = el.getBoundingClientRect();
+  const x = e.clientX - rect.left;
+  const y = e.clientY - rect.top;
+  const cx = rect.width / 2;
+  const cy = rect.height / 2;
+  const rotX = ((y - cy) / cy) * -8;
+  const rotY = ((x - cx) / cx) * 8;
+  el.style.transform = `perspective(600px) rotateX(${rotX}deg) rotateY(${rotY}deg) scale(1.04)`;
+  el.style.boxShadow = `${(x-cx)/10}px ${(y-cy)/10}px 28px rgba(14,165,233,0.25), 0 8px 32px rgba(0,0,0,0.12)`;
+  el.style.transition = 'transform 0.05s, box-shadow 0.05s';
+  el.style.zIndex = '5';
+}
+function obs3dReset(el) {
+  el.style.transform = '';
+  el.style.boxShadow = '';
+  el.style.transition = 'transform 0.35s cubic-bezier(.4,0,.2,1), box-shadow 0.35s';
+  el.style.zIndex = '';
+}
+
+/* ════════════════════════════════════════
+   INFINITE SCROLL NO FEED DE AVISTAMENTOS
+════════════════════════════════════════ */
+let _feedOffset = 0;
+let _feedLoading = false;
+let _feedHasMore = true;
+let _feedScrollObserver = null;
+const _FEED_PAGE_SIZE = 12;
+
+function setupFeedInfiniteScroll(containerId) {
+  if (_feedScrollObserver) { _feedScrollObserver.disconnect(); _feedScrollObserver = null; }
+  const container = document.getElementById(containerId);
+  if (!container) return;
+
+  let sentinel = document.getElementById('feed-scroll-sentinel');
+  if (sentinel) sentinel.remove();
+  sentinel = document.createElement('div');
+  sentinel.id = 'feed-scroll-sentinel';
+  sentinel.style.cssText = 'height:4px;grid-column:1/-1;';
+  container.appendChild(sentinel);
+
+  _feedScrollObserver = new IntersectionObserver(async entries => {
+    if (!entries[0].isIntersecting || _feedLoading || !_feedHasMore) return;
+    _feedLoading = true;
+    await appendFeedPage(containerId);
+    _feedLoading = false;
+  }, { rootMargin: '200px' });
+  _feedScrollObserver.observe(sentinel);
+}
+
+async function appendFeedPage(containerId) {
+  const container = document.getElementById(containerId);
+  if (!container) return;
+  try {
+    const { data, error } = await db
+      .from('observations')
+      .select('id, user_id, species_pop, species_sci, obs_date, location_label, notes, photo_url, companion_handle, published_inat')
+      .order('created_at', { ascending: false })
+      .range(_feedOffset, _feedOffset + _FEED_PAGE_SIZE - 1);
+    if (error || !data || data.length === 0) { _feedHasMore = false; return; }
+    if (data.length < _FEED_PAGE_SIZE) _feedHasMore = false;
+    _feedOffset += data.length;
+
+    const userIds = [...new Set(data.map(o => o.user_id).filter(Boolean))];
+    let profilesMap = {};
+    if (userIds.length) {
+      const { data: profData } = await db.from('profiles').select('id, nome, handle, avatar_url').in('id', userIds);
+      (profData || []).forEach(p => { profilesMap[p.id] = p; });
+    }
+    const newObs = data.map(o => {
+      const prof = profilesMap[o.user_id] || {};
+      return { id: o.id, species: o.species_pop || o.species_sci, sciName: o.species_sci, date: o.obs_date, location: o.location_label || '', notes: o.notes || '', photoUrl: o.photo_url || null, user: { name: prof.nome || prof.handle || 'Usuário', handle: prof.handle || '' }, companionHandle: o.companion_handle || null };
+    });
+
+    // Remove sentinel antes de inserir novos cards
+    const sentinel = document.getElementById('feed-scroll-sentinel');
+    if (sentinel) sentinel.remove();
+
+    const frag = document.createDocumentFragment();
+    newObs.forEach(obs => {
+      const div = document.createElement('div');
+      const userName = obs.user?.name || 'Usuário';
+      const userHandle = obs.user?.handle || '';
+      const hasPhoto = obs.photoUrl;
+      const obsId = obs.id;
+      const raridade = getRaridade(obs.sciName || '');
+      let cardClass = 'obs-card';
+      if (raridade === 'muito-rara') cardClass += ' obs-card-muito-rara';
+      else if (raridade === 'rara') cardClass += ' obs-card-rara';
+      else cardClass += ' obs-card-comum';
+      const safeJson = JSON.stringify(obs).replace(/"/g,'&quot;');
+      div.innerHTML = `<div class="${cardClass}" style="transform-style:preserve-3d;will-change:transform;"
+        onmousemove="obs3dTilt(this,event)" onmouseleave="obs3dReset(this)">
+        <div class="obs-card-img" style="cursor:${hasPhoto?'pointer':'default'};" onclick="${hasPhoto?`openPhotoExpand(${safeJson})`:''}">
+          ${hasPhoto ? `<img src="${escHtml(obs.photoUrl)}" loading="lazy" onerror="this.parentElement.innerHTML='<div class=no-img-emoji>🐦</div>'">` : `<div class="no-img-emoji">${getSpeciesEmoji(obs.species||'')}</div>`}
+          ${hasPhoto ? `<div style="position:absolute;inset:0;background:linear-gradient(transparent 60%,rgba(0,0,0,0.3));border-radius:inherit;pointer-events:none;"></div>` : ''}
+          ${raridade !== 'comum' ? `<div class="raridade-badge raridade-${raridade}">${raridade === 'muito-rara' ? '🔴 Muito Rara' : '🟡 Rara'}</div>` : ''}
+        </div>
+        <div class="obs-card-body">
+          <div class="obs-card-user">
+            <div class="obs-avatar" style="background:#0ea5e9;${userHandle?'cursor:pointer;':''}" onclick="${userHandle?'event.stopPropagation();openPublicProfile(\''+escHtml(userHandle)+'\')':''}">${escHtml((userName||'?')[0].toUpperCase())}</div>
+            <span class="obs-username" style="${userHandle?'cursor:pointer;color:var(--sky);':''}" onclick="${userHandle?'event.stopPropagation();openPublicProfile(\''+escHtml(userHandle)+'\')':''}">${escHtml(userName)}</span>
+            <span class="obs-date">${formatDate(obs.date||'')}</span>
+          </div>
+          <div class="obs-species" style="cursor:pointer;" onclick="event.stopPropagation();openSpeciesModal('${escHtml(obs.sciName||'')}','${escHtml(obs.species||obs.sciName||'')}')">${escHtml(capitalize(obs.species||obs.sciName||''))}</div>
+          <div class="obs-sci" style="cursor:pointer;font-style:italic;" onclick="event.stopPropagation();openSpeciesModal('${escHtml(obs.sciName||'')}','${escHtml(obs.species||obs.sciName||'')}')">${escHtml(obs.sciName||'')}</div>
+          ${obs.location ? `<div class="obs-location">📍 ${escHtml(obs.location)}</div>` : ''}
+        </div>
+        <div class="obs-card-footer">
+          <button class="obs-action-btn" id="like-btn-${obsId}" onclick="toggleLike('${obsId}',this)"><span id="like-icon-${obsId}">🤍</span> <span id="like-count-${obsId}">0</span></button>
+          <button class="obs-action-btn" id="comment-btn-${obsId}" onclick="openCommentModal('${obsId}','${capitalize(obs.species||obs.sciName||'')}')">💬 <span id="comment-count-${obsId}">0</span></button>
+        </div>
+      </div>`;
+      frag.appendChild(div.firstElementChild);
+    });
+    container.appendChild(frag);
+
+    // Re-adiciona sentinel
+    if (_feedHasMore) {
+      const newSentinel = document.createElement('div');
+      newSentinel.id = 'feed-scroll-sentinel';
+      newSentinel.style.cssText = 'height:4px;grid-column:1/-1;';
+      container.appendChild(newSentinel);
+      _feedScrollObserver.observe(newSentinel);
+    }
+    setTimeout(() => loadCardCounts(newObs), 80);
+  } catch(e) { console.warn('appendFeedPage:', e); }
+}
+
+
+/* ════════════════════════════════════════
    UPLOAD / ENVIO — APENAS SUPABASE
 ════════════════════════════════════════ */
 window.addEventListener('DOMContentLoaded', () => {
@@ -1893,7 +2162,13 @@ window.addEventListener('DOMContentLoaded', () => {
   document.getElementById('obs-date').value = new Date().toISOString().slice(0, 10);
 
   renderBirdOfDay();
+  // Home feed: mostra 4 cards estáticos sem scroll infinito
   renderFeed('home-feed', 4);
+  // Full feed: usa scroll infinito
+  _feedOffset = 0; _feedHasMore = true;
+  renderFeed('full-feed', _FEED_PAGE_SIZE).then(() => {
+    setupFeedInfiniteScroll('full-feed');
+  });
   renderUsers('');
   startAutoRefresh();
 });
@@ -1962,6 +2237,137 @@ async function uploadPhoto(file) {
   }
 }
 
+
+/* ════════════════════════════════════════
+   FILA DE REGISTROS EM LOTE
+════════════════════════════════════════ */
+let _obsQueue = []; // fila temporária de observações a enviar
+
+function addToQueue() {
+  if (!currentUser) { showToast('🔑 Faça login para registrar'); openAuthModal(); return; }
+  const noSpecies = document.getElementById('no-species-check')?.checked;
+  const species = noSpecies ? '' : (document.getElementById('species-input').value || '').trim();
+  const date = document.getElementById('obs-date').value;
+  if (!noSpecies && !species) { showToast('⚠️ Informe a espécie'); return; }
+  if (!date) { showToast('⚠️ Informe a data'); return; }
+
+  const photoFile = document.getElementById('photo-input').files[0] || null;
+  const match = SC_BIRDS.find(b =>
+    b.sci.toLowerCase() === species.toLowerCase() ||
+    b.pop.toLowerCase() === species.toLowerCase()
+  );
+  const entry = {
+    species, noSpecies, match,
+    date,
+    time: document.getElementById('obs-time').value || '',
+    location: currentLocation ? { ...currentLocation } : null,
+    notes: document.getElementById('obs-notes').value || '',
+    photoFile,
+    photoPreview: photoFile ? URL.createObjectURL(photoFile) : null,
+    publishInat: false, // document.getElementById('inat-publish')?.checked — desabilitado temporariamente
+    id: Date.now()
+  };
+  _obsQueue.push(entry);
+  renderObsQueue();
+  // Limpa form para próximo
+  document.getElementById('species-input').value = '';
+  document.getElementById('obs-notes').value = '';
+  document.getElementById('obs-time').value = '';
+  removePreview();
+  currentLocation = null;
+  document.getElementById('location-display').textContent = 'Nenhuma localização selecionada';
+  document.getElementById('location-display').classList.remove('has-location');
+  const msearch = document.getElementById('municipio-search');
+  if (msearch) msearch.value = '';
+  document.getElementById('municipio-input-wrap').style.display = 'none';
+  const btnGps = document.getElementById('btn-gps');
+  if (btnGps) { btnGps.textContent = '📍 GPS'; btnGps.style.cssText = ''; }
+  _selectedCompanions = [];
+  renderSelectedCompanions();
+  showToast(`✅ Adicionado à fila! (${_obsQueue.length} na fila)`);
+}
+
+function removeFromQueue(id) {
+  _obsQueue = _obsQueue.filter(o => o.id !== id);
+  renderObsQueue();
+}
+
+function renderObsQueue() {
+  let panel = document.getElementById('obs-queue-panel');
+  if (!panel) {
+    panel = document.createElement('div');
+    panel.id = 'obs-queue-panel';
+    panel.style.cssText = 'margin-top:12px;border:1.5px solid var(--sky);border-radius:var(--radius-md);padding:12px;background:var(--card);';
+    const form = document.getElementById('obs-form') || document.querySelector('.obs-form-wrap');
+    if (form) form.appendChild(panel);
+  }
+  if (_obsQueue.length === 0) { panel.style.display = 'none'; return; }
+  panel.style.display = 'block';
+  panel.innerHTML = `
+    <div style="font-weight:700;font-size:13px;margin-bottom:8px;color:var(--sky);">📋 Fila de envio (${_obsQueue.length} registro${_obsQueue.length > 1 ? 's' : ''})</div>
+    ${_obsQueue.map(o => `
+      <div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--border);">
+        ${o.photoPreview ? `<img src="${o.photoPreview}" style="width:36px;height:36px;border-radius:6px;object-fit:cover;flex-shrink:0;">` : '<div style="width:36px;height:36px;border-radius:6px;background:var(--bg);display:flex;align-items:center;justify-content:center;font-size:18px;">🐦</div>'}
+        <div style="flex:1;min-width:0;">
+          <div style="font-size:12px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escHtml(o.noSpecies ? '(não especificada)' : (o.match ? capitalize(o.match.pop) : o.species))}</div>
+          <div style="font-size:11px;color:var(--text-muted);">${escHtml(o.date)}${o.location ? ' · ' + escHtml(o.location.label || '') : ''}</div>
+        </div>
+        <button onclick="removeFromQueue(${o.id})" style="background:none;border:none;cursor:pointer;color:var(--text-muted);font-size:16px;padding:2px 6px;" title="Remover">✕</button>
+      </div>
+    `).join('')}
+    <button onclick="submitQueue()" style="margin-top:10px;width:100%;height:38px;border:none;border-radius:var(--radius-md);background:linear-gradient(135deg,var(--sky),var(--forest));color:white;font-weight:700;font-size:13px;cursor:pointer;">
+      📤 Enviar ${_obsQueue.length} registro${_obsQueue.length > 1 ? 's' : ''} de uma vez
+    </button>
+  `;
+}
+
+async function submitQueue() {
+  if (_obsQueue.length === 0) return;
+  if (!currentUser) { openAuthModal(); return; }
+  const btn = document.getElementById('obs-queue-panel')?.querySelector('button[onclick="submitQueue()"]');
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Enviando...'; }
+
+  let successCount = 0;
+  for (const entry of [..._obsQueue]) {
+    try {
+      let photoUrl = null;
+      if (entry.photoFile) {
+        photoUrl = await uploadPhoto(entry.photoFile);
+      }
+      const companionHandle = entry.companions.length > 0 ? entry.companions[0].handle : null;
+      const companionId     = entry.companions.length > 0 ? entry.companions[0].id     : null;
+      const { error } = await db.from('observations').insert({
+        user_id:          currentUser.id,
+        species_sci:      entry.match ? entry.match.sci : (entry.noSpecies ? null : entry.species),
+        species_pop:      entry.match ? capitalize(entry.match.pop) : (entry.noSpecies ? null : entry.species),
+        obs_date:         entry.date,
+        obs_time:         entry.time || null,
+        lat:              entry.location?.lat ?? null,
+        lng:              entry.location?.lng ?? null,
+        location_label:   entry.location ? (entry.location.label || null) : null,
+        notes:            entry.notes || null,
+        photo_url:        photoUrl,
+        published_inat:   entry.publishInat,
+        companion_handle: companionHandle,
+        companion_id:     companionId
+      });
+      if (!error) {
+        if (entry.match && !entry.noSpecies) {
+          foundSpecies.add(entry.match.sci);
+          await db.from('species_seen').upsert({ user_id: currentUser.id, species_sci: entry.match.sci });
+        }
+        _obsQueue = _obsQueue.filter(o => o.id !== entry.id);
+        successCount++;
+      }
+    } catch(e) { console.warn('Erro ao enviar da fila:', e); }
+  }
+  updateChecklistProgress();
+  invalidateCache('feed'); invalidateCache('profile');
+  renderObsQueue();
+  showToast(successCount > 0 ? `✅ ${successCount} registro${successCount > 1 ? 's' : ''} enviado${successCount > 1 ? 's' : ''} com sucesso!` : '⚠️ Erro ao enviar. Tente novamente.');
+  if (_obsQueue.length === 0) setTimeout(() => navigateTo('feed', document.querySelector('[data-page=feed]')), 800);
+}
+
 function btn_submit_label(text) {
   const btn = document.getElementById('btn-submit');
   if (btn) btn.innerHTML = text;
@@ -2020,8 +2426,11 @@ async function submitObservation() {
       : '',
     notes: document.getElementById('obs-notes').value,
     photoUrl,
-    publishInat: document.getElementById('inat-publish').checked,
+    publishInat: false, // document.getElementById('inat-publish')?.checked — desabilitado temporariamente
   };
+
+  // Verifica se é espécie nova ANTES de adicionar
+  const isNewSpecies = match && !noSpecies && !foundSpecies.has(match.sci);
 
   // Marca como encontrada no checklist
   if (match && !noSpecies) {
@@ -2049,7 +2458,7 @@ async function submitObservation() {
       : null,
     notes:          obs.notes || null,
     photo_url:      photoUrl,
-    published_inat: obs.publishInat,
+    published_inat: false, // desabilitado temporariamente
     companion_handle: companionHandle,
     companion_id:     companionId
   });
@@ -2065,8 +2474,9 @@ async function submitObservation() {
   btn.disabled = false;
   btn.innerHTML = '📤 Enviar Avistamento';
 
-  const inatMsg = obs.publishInat ? ' (marcado para referência no iNaturalist)' : '!';
-  showToast(`✅ Avistamento registrado${inatMsg}`);
+  // Animação de celebração com info de espécie nova ou já encontrada
+  showObsCelebration(obs.species || obs.sciName, isNewSpecies);
+  invalidateCache('feed'); invalidateCache('profile');
 
   // Limpa formulário
   document.getElementById('species-input').value = '';
@@ -2329,6 +2739,122 @@ function switchAuthTab(tab, btn) {
   if (btn) btn.classList.add('active');
 }
 
+
+/* ════════════════════════════════════════
+   ANIMAÇÃO DE LOGIN
+════════════════════════════════════════ */
+function showLoginAnimation(userName) {
+  // Remove qualquer overlay anterior
+  const existing = document.getElementById('login-overlay');
+  if (existing) existing.remove();
+
+  const overlay = document.createElement('div');
+  overlay.id = 'login-overlay';
+  overlay.style.cssText = [
+    'position:fixed','inset:0','z-index:99999',
+    'display:flex','flex-direction:column','align-items:center','justify-content:center','gap:18px',
+    'background:var(--bg)','opacity:0','transition:opacity .3s ease'
+  ].join(';');
+
+  overlay.innerHTML = `
+    <div style="position:relative;width:90px;height:90px;">
+      <div id="login-bird-orbit" style="position:absolute;inset:0;animation:loginOrbit 1.1s linear infinite;">
+        <span style="position:absolute;top:-10px;left:50%;transform:translateX(-50%);font-size:22px;">🐦</span>
+      </div>
+      <div style="position:absolute;inset:8px;border-radius:50%;background:linear-gradient(135deg,var(--sky),var(--forest));display:flex;align-items:center;justify-content:center;font-size:34px;box-shadow:0 4px 20px rgba(14,165,233,0.4);">
+        🌿
+      </div>
+    </div>
+    <div style="text-align:center;">
+      <div style="font-family:'Syne',sans-serif;font-size:22px;font-weight:800;color:var(--text);animation:loginFadeUp .5s ease .2s both;">
+        Bem-vindo${userName ? ', ' + userName.split(' ')[0] : ''}!
+      </div>
+      <div style="font-size:13px;color:var(--text-muted);margin-top:4px;animation:loginFadeUp .5s ease .4s both;">
+        Preparando seu ambiente…
+      </div>
+    </div>
+    <div style="width:220px;height:4px;background:var(--border);border-radius:4px;overflow:hidden;animation:loginFadeUp .5s ease .3s both;">
+      <div style="height:100%;background:linear-gradient(90deg,var(--sky),var(--forest));border-radius:4px;animation:loginBar 1.4s ease-out .2s forwards;width:0%;"></div>
+    </div>
+  `;
+
+  // Keyframes dinâmicos (só se não existirem)
+  if (!document.getElementById('login-keyframes')) {
+    const style = document.createElement('style');
+    style.id = 'login-keyframes';
+    style.textContent = `
+      @keyframes loginOrbit {
+        from { transform: rotate(0deg); }
+        to   { transform: rotate(360deg); }
+      }
+      @keyframes loginFadeUp {
+        from { opacity: 0; transform: translateY(12px); }
+        to   { opacity: 1; transform: translateY(0); }
+      }
+      @keyframes loginBar {
+        from { width: 0%; }
+        to   { width: 100%; }
+      }
+    `;
+    document.head.appendChild(style);
+  }
+
+  document.body.appendChild(overlay);
+  // Fade in
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => { overlay.style.opacity = '1'; });
+  });
+  // Remove após animação
+  setTimeout(() => {
+    overlay.style.opacity = '0';
+    setTimeout(() => overlay.remove(), 350);
+  }, 1800);
+}
+
+
+/* ════════════════════════════════════════
+   HELPER — CRÉDITO COM COMPANIONS
+════════════════════════════════════════ */
+function buildCreditHtml(obs) {
+  const handle  = obs.user?.handle || '';
+  const name    = obs.user?.name   || obs.userName || 'Usuário';
+  const inatId  = obs.inatId || obs.inat_id || null;
+  const isAvAvista = !!obs.id && !inatId;
+
+  // Monta lista de companions (pode ser array ou single)
+  const companions = [];
+  if (obs.companionHandle) companions.push({ handle: obs.companionHandle, name: obs.companionName || obs.companionHandle });
+  if (obs.companions && Array.isArray(obs.companions)) {
+    obs.companions.forEach(c => { if (c.handle && !companions.find(x => x.handle === c.handle)) companions.push(c); });
+  }
+
+  // Monta parte do autor principal
+  let authorPart = '';
+  if (isAvAvista && handle) {
+    authorPart = `<span onclick="openPublicProfile('${escHtml(handle)}')" style="color:var(--sky);cursor:pointer;font-weight:600;">@${escHtml(handle)}</span>`;
+  } else if (inatId) {
+    authorPart = `<a href="https://www.inaturalist.org/observations/${inatId}" target="_blank" style="color:var(--sky);font-weight:600;">${escHtml(name)} · iNaturalist ↗</a>`;
+  } else if (name) {
+    authorPart = `<span style="font-weight:600;">${escHtml(name)}</span>`;
+  }
+
+  // Monta parte dos companions
+  let companionPart = '';
+  if (companions.length > 0) {
+    const parts = companions.map(c =>
+      `<span onclick="openPublicProfile('${escHtml(c.handle)}')" style="color:var(--sky);cursor:pointer;font-weight:600;">@${escHtml(c.handle)}</span>`
+    );
+    if (parts.length === 1) {
+      companionPart = ' e ' + parts[0];
+    } else {
+      companionPart = ', ' + parts.slice(0, -1).join(', ') + ' e ' + parts[parts.length - 1];
+    }
+  }
+
+  if (!authorPart && !companionPart) return '';
+  return `📸 ${authorPart}${companionPart} · Ave à Vista`;
+}
+
 async function doLogin() {
   const email = document.getElementById('login-email').value.trim();
   const pass  = document.getElementById('login-pass').value;
@@ -2345,7 +2871,8 @@ async function doLogin() {
       return;
     }
     document.getElementById('auth-modal').classList.remove('open');
-    showToast('✅ Bem-vindo de volta!');
+    const loginName = (await db.from('profiles').select('nome').eq('id', data.user.id).maybeSingle()).data?.nome || '';
+    showLoginAnimation(loginName);
   } finally {
     if (btn) { btn.disabled = false; btn.textContent = 'Entrar'; }
   }
@@ -2444,6 +2971,26 @@ function updateSidebarAuth() {
 }
 
 async function doLogout() {
+  // Animação de desconexão
+  const overlay = document.createElement('div');
+  overlay.id = 'logout-overlay';
+  overlay.style.cssText = 'position:fixed;inset:0;background:var(--bg);z-index:99999;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;';
+  overlay.innerHTML = `
+    <div style="font-size:48px;animation:spin 1.2s linear infinite;">🐦</div>
+    <div style="font-weight:700;font-size:18px;color:var(--text);">Aguarde, estamos te desconectando...</div>
+    <div style="width:200px;height:4px;background:var(--border);border-radius:4px;overflow:hidden;">
+      <div style="height:100%;background:var(--sky);border-radius:4px;animation:logoutProgress 1.2s ease-out forwards;"></div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  // Garante que as animações estejam definidas
+  if (!document.getElementById('logout-keyframes')) {
+    const style = document.createElement('style');
+    style.id = 'logout-keyframes';
+    style.textContent = `@keyframes spin{to{transform:rotate(360deg)}}@keyframes logoutProgress{from{width:0%}to{width:100%}}`;
+    document.head.appendChild(style);
+  }
+  await new Promise(r => setTimeout(r, 1200));
   stopRealtimeSubscriptions();
   stopNotifRealtime();
   await db.auth.signOut();
@@ -2455,6 +3002,7 @@ async function doLogout() {
   const pH = document.getElementById('profile-handle');
   if (pN) pN.textContent = 'Faça login para ver seu perfil';
   if (pH) pH.textContent = '';
+  overlay.remove();
   navigateTo('home', document.querySelector('[data-page=home]'));
   document.querySelectorAll('.sidebar-btn').forEach(b => b.classList.remove('active'));
   document.querySelector('[data-page=home]')?.classList.add('active');
@@ -2668,6 +3216,30 @@ function showCelebration(pop) {
   document.getElementById('celebration-sub').textContent = `Você encontrou o(a) ${capitalize(pop)}!`;
   cel.classList.add('show');
   setTimeout(() => cel.classList.remove('show'), 2800);
+}
+
+/* Celebração específica para novos avistamentos */
+function showObsCelebration(speciesName, isNew) {
+  // Cria overlay de celebração dedicado
+  let ov = document.getElementById('_obs_celebration');
+  if (!ov) {
+    ov = document.createElement('div');
+    ov.id = '_obs_celebration';
+    ov.style.cssText = 'position:fixed;inset:0;z-index:99998;display:flex;align-items:center;justify-content:center;pointer-events:none;';
+    document.body.appendChild(ov);
+  }
+  ov.innerHTML = `
+    <div style="background:var(--card);border:2px solid ${isNew?'var(--forest)':'var(--sky)'};border-radius:var(--radius-xl);padding:32px 40px;text-align:center;box-shadow:var(--shadow-lg);animation:obsCelIn .4s cubic-bezier(.34,1.56,.64,1);max-width:360px;pointer-events:auto;">
+      <div style="font-size:52px;margin-bottom:8px;">${isNew?'🎉':'📸'}</div>
+      <div style="font-family:'Syne',sans-serif;font-size:20px;font-weight:800;color:${isNew?'var(--forest)':'var(--sky)'};margin-bottom:4px;">
+        ${isNew ? 'Nova espécie registrada!' : 'Avistamento registrado!'}
+      </div>
+      <div style="font-size:15px;font-weight:600;color:var(--text);margin-bottom:6px;">${escHtml(capitalize(speciesName||''))}</div>
+      <div style="font-size:13px;color:var(--text-muted);">${isNew ? '🌟 Adicionada ao seu checklist!' : '✅ Já estava no seu checklist'}</div>
+    </div>`;
+  ov.style.display = 'flex';
+  launchConfetti();
+  setTimeout(() => { ov.innerHTML = ''; ov.style.display = 'none'; }, 3200);
 }
 
 function launchConfetti() {
@@ -3060,7 +3632,7 @@ async function loadRanking() {
     if (_rankTab === 'total') {
       const { data, error } = await db
         .from('species_seen')
-        .select('user_id, profiles(nome, handle, avatar_url)')
+        .select('user_id, profiles:profiles!observations_user_id_fkey(nome, handle, avatar_url)')
         .order('user_id');
       if (error) throw error;
       const byUser = {};
@@ -3097,7 +3669,7 @@ async function loadRanking() {
     } else {
       const { data, error } = await db
         .from('species_seen')
-        .select('user_id, species_sci, profiles(nome, handle, avatar_url)');
+        .select('user_id, species_sci, profiles:profiles!observations_user_id_fkey(nome, handle, avatar_url)');
       if (error) throw error;
       const byUser = {};
       (data || []).forEach(row => {
@@ -3365,6 +3937,8 @@ function getFriendLevel(sharedObs) {
 async function renderAmizades() {
   const grid = document.getElementById('amizades-grid');
   if (!grid) return;
+  if (_renderGuards['amizades']) return;
+  _renderGuards['amizades'] = true;
   let friends = [];
   if (currentUser?.id) {
     try {
@@ -3377,11 +3951,12 @@ async function renderAmizades() {
         const other = mine ? f.addr : f.req;
         return { handle: other?.handle||'?', name: other?.nome||'Usuário', color:'#0ea5e9', sharedObs: f.shared_obs||0 };
       });
-    } catch(e) { console.warn(e); }
+    } catch(e) { console.warn(e); _renderGuards['amizades'] = false; }
   }
   friends.sort((a,b) => b.sharedObs - a.sharedObs);
   if (!friends.length) {
     grid.innerHTML = '<p style="color:var(--text-muted);text-align:center;padding:32px;">Nenhuma amizade ainda.<br>Registre avistamentos em conjunto! 🐦</p>';
+    _renderGuards['amizades'] = false;
     return;
   }
   grid.innerHTML = friends.map(f => {
@@ -3391,19 +3966,26 @@ async function renderAmizades() {
     const safeName   = escHtml(f.name);
     const safeHandle = escHtml(f.handle);
     const initial    = (f.name||'?')[0].toUpperCase();
-    return `<div style="display:flex;align-items:center;gap:12px;padding:14px;background:var(--card);border:1px solid var(--border);border-radius:var(--radius-md);">
-      <div style="width:44px;height:44px;border-radius:50%;background:${escHtml(f.color||'#0ea5e9')};display:flex;align-items:center;justify-content:center;color:white;font-weight:700;font-size:18px;flex-shrink:0;">${initial}</div>
+    const nextLabel  = fl.lvl < 5 ? escHtml(FRIEND_LEVELS[fl.lvl + 1]?.label || '') : '';
+    return `<div style="display:flex;align-items:center;gap:12px;padding:14px;background:var(--card);border:1px solid var(--border);border-radius:var(--radius-md);cursor:pointer;" onclick="openPublicProfile('${safeHandle}')">
+      <div style="width:48px;height:48px;border-radius:50%;background:${escHtml(f.color||'#0ea5e9')};display:flex;align-items:center;justify-content:center;color:white;font-weight:700;font-size:20px;flex-shrink:0;">${initial}</div>
       <div style="flex:1;min-width:0;">
-        <div style="font-weight:700;font-size:14px;">${safeName}</div>
-        <div style="font-size:12px;color:var(--text-muted);">@${safeHandle} · ${f.sharedObs} registros juntos</div>
-        <div style="display:flex;align-items:center;gap:6px;margin-top:4px;">
-          <span class="obs-rank-badge ${fl.cls}" style="font-size:10.5px;">${escHtml(fl.label)}</span>
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:6px;">
+          <div style="font-weight:700;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${safeName}</div>
+          <span class="obs-rank-badge ${fl.cls}" style="font-size:10px;flex-shrink:0;">${escHtml(fl.label)}</span>
         </div>
-        <div class="friendship-bar"><div class="friendship-fill ${fl.cls}" style="width:${pct}%;"></div></div>
-        <div style="font-size:10px;color:var(--text-muted);margin-top:2px;">${fl.lvl<5?`${f.sharedObs}/${nextLvl.min} para nível ${fl.lvl+1}`:'Nível máximo 🌟'}</div>
+        <div style="font-size:11px;color:var(--text-muted);margin-top:1px;">@${safeHandle} · ${f.sharedObs} avistamento${f.sharedObs !== 1 ? 's' : ''} juntos</div>
+        <div style="margin-top:6px;">
+          <div class="friendship-bar"><div class="friendship-fill ${fl.cls}" style="width:${pct}%;transition:width .6s ease;"></div></div>
+          <div style="display:flex;justify-content:space-between;margin-top:3px;">
+            <span style="font-size:10px;color:var(--text-muted);">${fl.lvl < 5 ? `${f.sharedObs} / ${nextLvl.min} obs para ${nextLabel}` : '🌟 Nível máximo'}</span>
+            <span style="font-size:10px;color:var(--text-muted);">${fl.lvl < 5 ? Math.round(pct) + '%' : ''}</span>
+          </div>
+        </div>
       </div>
     </div>`;
   }).join('');
+  _renderGuards['amizades'] = false;
 }
 
 /* ════════════════════════════════════════
@@ -3449,7 +4031,7 @@ async function renderCommentList(obsId) {
   const list = document.getElementById('comment-list');
   try {
     const { data } = await db.from('comments')
-      .select('id, content, created_at, user_id, profiles(nome,handle)')
+      .select('id, content, created_at, user_id, profiles:profiles!comments_user_id_fkey(nome,handle)')
       .eq('obs_id', obsId)
       .order('created_at', { ascending: true });
     if (!data || !data.length) {
@@ -3503,24 +4085,27 @@ async function openPhotoExpand(obs) {
   const imgEl = document.getElementById('photo-expand-img');
   imgEl.src = obs.photoUrl;
   imgEl.style.cursor = 'zoom-in';
-  imgEl.onclick = () => showFullPhoto(obs.photoUrl);
+  // Zoom com scroll do mouse na foto expandida
+  imgEl.onclick = () => showFullPhotoZoom(obs.photoUrl);
 
   document.getElementById('photo-expand-species').textContent = capitalize(obs.species || obs.sciName || '');
-  document.getElementById('photo-expand-sci').textContent = obs.sciName || '';
+  // nome científico clicável
+  const sciEl = document.getElementById('photo-expand-sci');
+  sciEl.textContent = obs.sciName || '';
+  sciEl.style.cursor = obs.sciName ? 'pointer' : '';
+  sciEl.onclick = obs.sciName ? () => {
+    document.getElementById('photo-expand-modal').classList.remove('open');
+    setTimeout(() => openSpeciesModal(obs.sciName, obs.species || obs.sciName), 200);
+  } : null;
+  // nome popular clicável
+  const speciesEl = document.getElementById('photo-expand-species');
+  speciesEl.style.cursor = obs.sciName ? 'pointer' : '';
+  speciesEl.onclick = obs.sciName ? () => {
+    document.getElementById('photo-expand-modal').classList.remove('open');
+    setTimeout(() => openSpeciesModal(obs.sciName, obs.species || obs.sciName), 200);
+  } : null;
 
-  const handle  = obs.user?.handle || '';
-  const name    = obs.user?.name   || obs.userName || 'Usuário';
-  const inatId  = obs.inatId || obs.inat_id || null;
-  const isAvAvista = !!obs.id && !inatId;
-  let credit = '';
-  if (isAvAvista && handle) {
-    credit = `📸 <span onclick="openPublicProfile('${escHtml(handle)}')" style="color:var(--sky);cursor:pointer;font-weight:600;">@${escHtml(handle)}</span> · Ave à Vista`;
-  } else if (inatId) {
-    credit = `📸 <a href="https://www.inaturalist.org/observations/${inatId}" target="_blank" style="color:var(--sky);font-weight:600;">${escHtml(name)} · iNaturalist ↗</a>`;
-  } else if (name) {
-    credit = `📸 ${escHtml(name)}`;
-  }
-
+  const credit = buildCreditHtml(obs);
   document.getElementById('photo-expand-meta').innerHTML =
     `${credit ? credit+'<br>' : ''}📅 ${formatDate(obs.date)||'—'}${obs.location?' &nbsp;📍 '+escHtml(obs.location):''}${obs.notes?'<br>📝 '+escHtml(obs.notes):''}`;
 
@@ -3978,7 +4563,7 @@ async function renderSuggestions(obsId, listId) {
     // Busca sugestões e dono do avistamento em paralelo
     const [sugR, obsR] = await Promise.all([
       db.from('species_suggestions')
-        .select('*, profiles(nome,handle)')
+        .select('*, profiles:profiles!observations_user_id_fkey(nome,handle)')
         .eq('obs_id', obsId)
         .order('created_at', { ascending: false }),
       db.from('observations').select('user_id').eq('id', obsId).maybeSingle()
@@ -4120,7 +4705,7 @@ async function loadBirdDayFinders(sci) {
   wrap.style.display = 'none';
   try {
     const { data } = await db.from('observations')
-      .select('photo_url, profiles(id, nome, handle, avatar_url)')
+      .select('photo_url, profiles:profiles!observations_user_id_fkey(id, nome, handle, avatar_url)')
       .eq('species_sci', sci)
       .not('photo_url', 'is', null)
       .order('created_at', { ascending: false })
@@ -4166,7 +4751,6 @@ async function loadCardCounts(obsList) {
   const ids = obsList.map(o => o.id).filter(Boolean);
   if (!ids.length) return;
   try {
-    // Batch: busca todas as curtidas e comentários de uma vez
     const [likesR, commentsR] = await Promise.all([
       db.from('likes').select('obs_id, user_id').in('obs_id', ids),
       db.from('comments').select('obs_id').in('obs_id', ids)
@@ -4178,15 +4762,19 @@ async function loadCardCounts(obsList) {
       const cc   = commentsData.filter(c => c.obs_id === id).length;
       const lcEl = document.getElementById('like-count-' + id);
       const ccEl = document.getElementById('comment-count-' + id);
-      if (lcEl) lcEl.textContent = lc > 0 ? lc : '';
-      if (ccEl) ccEl.textContent = cc > 0 ? cc : '';
+      // sempre mostra contagem, mesmo 0
+      if (lcEl) lcEl.textContent = lc;
+      if (ccEl) ccEl.textContent = cc;
+      const btn  = document.getElementById('like-btn-' + id);
+      const icon = document.getElementById('like-icon-' + id);
       if (currentUser) {
         const myLike = likesData.find(l => l.obs_id === id && l.user_id === currentUser.id);
         if (myLike) {
-          const btn  = document.getElementById('like-btn-' + id);
-          const icon = document.getElementById('like-icon-' + id);
           if (btn)  btn.classList.add('liked');
           if (icon) icon.textContent = '❤️';
+        } else {
+          if (btn)  btn.classList.remove('liked');
+          if (icon) icon.textContent = '🤍';
         }
       }
     }
@@ -4201,7 +4789,7 @@ async function loadExpandComments(obsId) {
   if (!el) return;
   try {
     const { data } = await db.from('comments')
-      .select('id, content, created_at, user_id, profiles(nome,handle)')
+      .select('id, content, created_at, user_id, profiles:profiles!comments_user_id_fkey(nome,handle)')
       .eq('obs_id', obsId)
       .order('created_at', { ascending: true });
     if (!data || !data.length) { el.innerHTML = ''; return; }
@@ -4275,21 +4863,39 @@ let _photoIndexPromise = null; // garante que o índice seja carregado apenas um
 
 function ensurePhotoIndex() {
   if (_photoIndexPromise) return _photoIndexPromise;
-  _photoIndexPromise = fetch('https://raw.githubusercontent.com/brennobenk/OrnitologiaSantaCatarina/main/photo_index.json')
-    .then(r => { if (!r.ok) throw new Error('network'); return r.json(); })
+  _photoIndexPromise = fetch('https://raw.githubusercontent.com/brennobenk/OrnitologiaSantaCatarina/main/photo_index.json', { cache: 'no-cache' })
+    .then(r => {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    })
     .then(raw => {
       window._photoIndex = {};
-      for (const [photographer, info] of Object.entries(raw)) {
-        for (const foto of (info.fotos || [])) {
-          const key = (foto.cientifico || '').toLowerCase().trim();
-          if (!key) continue;
+      // Suporte tanto ao formato {fotógrafo: {fotos:[...]}} quanto [{cientifico,url,author}]
+      if (Array.isArray(raw)) {
+        raw.forEach(item => {
+          const key = (item.cientifico || item.sci || '').toLowerCase().trim();
+          if (!key) return;
           if (!window._photoIndex[key]) window._photoIndex[key] = [];
-          window._photoIndex[key].push({ url: foto.url, author: photographer, profileUrl: info.wikiaves || null });
+          window._photoIndex[key].push({ url: item.url, author: item.author || item.fotografo || 'Ave à Vista', profileUrl: item.wikiaves || null });
+        });
+      } else {
+        for (const [photographer, info] of Object.entries(raw)) {
+          for (const foto of (info.fotos || [])) {
+            const key = (foto.cientifico || foto.sci || '').toLowerCase().trim();
+            if (!key) continue;
+            if (!window._photoIndex[key]) window._photoIndex[key] = [];
+            window._photoIndex[key].push({ url: foto.url, author: photographer, profileUrl: info.wikiaves || null });
+          }
         }
       }
+      console.log('[photo_index] carregado:', Object.keys(window._photoIndex).length, 'espécies com foto');
       return window._photoIndex;
     })
-    .catch(() => { _photoIndexPromise = null; return {}; });
+    .catch(e => {
+      console.warn('[photo_index] falha ao carregar:', e.message);
+      _photoIndexPromise = null;
+      return {};
+    });
   return _photoIndexPromise;
 }
 
@@ -4305,18 +4911,37 @@ async function getBirdPhoto(sci) {
       return _birdPhotoCache[sci];
     }
   } catch(e) {}
+  // Fallback: iNaturalist direto (suporta CORS nativamente)
   try {
-    const r = await fetch(`https://api.inaturalist.org/v1/taxa?q=${encodeURIComponent(sci)}&rank=species&limit=1`);
+    const inatUrl = `https://api.inaturalist.org/v1/taxa?q=${encodeURIComponent(sci)}&rank=species&per_page=1`;
+    const r = await fetch(inatUrl);
     const j = await r.json();
     const url = j.results?.[0]?.default_photo?.medium_url;
     if (url) {
       const attr = j.results[0].default_photo?.attribution || '';
       const m = attr.match(/\(c\)\s*([^,]+)/i);
-      const realAuthor = m ? m[1].trim() : 'iNaturalist';
-      _birdPhotoCache[sci] = { url, author: realAuthor, source: 'inat', inatId: j.results[0].id };
+      const author = m ? m[1].trim() : 'iNaturalist';
+      _birdPhotoCache[sci] = { url, author, source: 'inat', inatId: j.results[0].id };
       return _birdPhotoCache[sci];
     }
-  } catch(e) {}
+  } catch(e) { console.warn('[getBirdPhoto inat]', sci, e?.message); }
+  // Fallback 2: eBird / Wikimedia via nome científico
+  try {
+    const ebirdUrl = `https://api.ebird.org/v2/ref/taxonomy/ebird?fmt=json&species=${encodeURIComponent(sci)}`;
+    // eBird não tem endpoint de foto público — usa Wikimedia como fallback real
+    const wikiUrl = `https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(sci.replace(/ /g,'_'))}`;
+    const wr = await fetch(wikiUrl);
+    if (wr.ok) {
+      const wj = await wr.json();
+      const url = wj?.thumbnail?.source || wj?.originalimage?.source;
+      if (url) {
+        _birdPhotoCache[sci] = { url, author: 'Wikipedia', source: 'wiki' };
+        return _birdPhotoCache[sci];
+      }
+    }
+  } catch(e) { console.warn('[wiki fallback]', sci, e?.message); }
+
+  _birdPhotoCache[sci] = null;
   return null;
 }
 
@@ -4350,64 +4975,137 @@ document.addEventListener('click', e => {
     sug.style.display='none';
 });
 
+/* ════════════════════════════════════════
+   GLOSSÁRIO — INFINITE SCROLL (50 por vez)
+════════════════════════════════════════ */
+let _birdsCurrentList = [];
+let _birdsPage = 0;
+const _BIRDS_PER_PAGE = 50;
+let _birdsScrollObserver = null;
+
 function renderBirdsGrid(birds) {
+  _birdsCurrentList = birds || [];
+  _birdsPage = 0;
   const grid = document.getElementById('birds-grid');
   if (!grid) return;
-  if (!birds || !birds.length) {
-    grid.innerHTML='<div style="grid-column:1/-1;text-align:center;padding:40px;color:var(--text-muted);">Nenhuma ave encontrada.</div>';
+  // Remove sentinel e loader anteriores
+  const oldSentinel = document.getElementById('birds-scroll-sentinel');
+  if (oldSentinel) oldSentinel.remove();
+  const oldLoader = document.getElementById('birds-scroll-loader');
+  if (oldLoader) oldLoader.remove();
+  if (_birdsScrollObserver) { _birdsScrollObserver.disconnect(); _birdsScrollObserver = null; }
+
+  if (!_birdsCurrentList.length) {
+    grid.innerHTML = '<div style="grid-column:1/-1;text-align:center;padding:40px;color:var(--text-muted);">Nenhuma ave encontrada.</div>';
     return;
   }
-  grid.innerHTML = birds.map(b => {
-    const found  = foundSpecies.has(b.sci);
-    const atRisk = b.sc && b.sc !== 'LC';
-    const safeId = b.sci.replace(/[^a-zA-Z0-9]/g,'_');
-    return `<div id="bcard_${safeId}" onclick="openSpeciesModal('${b.sci.replace(/'/g,"\\'")}','${b.pop.replace(/'/g,"\\'")}');"
-      style="position:relative;border-radius:var(--radius-md);overflow:hidden;cursor:pointer;height:130px;background:var(--sky-light);transition:transform .15s,box-shadow .15s;"
-      onmouseover="this.style.transform='translateY(-3px)';this.style.boxShadow='var(--shadow-md)'"
-      onmouseout="this.style.transform='';this.style.boxShadow=''">
-      <div id="bcard_bg_${safeId}" style="position:absolute;inset:0;background:linear-gradient(135deg,var(--sky),var(--forest));" data-sci="${escHtml(b.sci)}"></div>
-      <div style="position:absolute;inset:0;background:linear-gradient(transparent 30%,rgba(0,0,0,0.75));"></div>
-      <div style="position:absolute;bottom:0;left:0;right:0;padding:8px 10px;">
-        <div style="font-weight:700;font-size:12px;color:white;line-height:1.2;text-shadow:0 1px 4px rgba(0,0,0,0.8);">${capitalize(b.pop)}</div>
-        <div style="font-size:9.5px;color:rgba(255,255,255,0.75);font-style:italic;">${b.sci}</div>
-        <div style="display:flex;gap:3px;margin-top:3px;">
-          ${found  ? '<span style="font-size:9px;background:var(--forest);color:white;border-radius:10px;padding:1px 5px;font-weight:700;">✓</span>' : ''}
-          ${atRisk ? '<span style="font-size:9px;background:rgba(239,68,68,0.8);color:white;border-radius:10px;padding:1px 5px;font-weight:700;">⚠</span>' : ''}
-        </div>
-      </div>
-    </div>`;
-  }).join('');
+  grid.innerHTML = '';
+  _appendBirdsPage(grid);
+  _setupBirdsScrollObserver(grid);
+}
 
-  // Lazy-load com IntersectionObserver para não sobrecarregar
-  const bgEls = grid.querySelectorAll('[id^="bcard_bg_"]');
+function _buildBirdCard(b) {
+  const found  = foundSpecies.has(b.sci);
+  const atRisk = b.sc && b.sc !== 'LC';
+  const safeId = b.sci.replace(/[^a-zA-Z0-9]/g,'_');
+  return `<div id="bcard_${safeId}" onclick="openSpeciesModal('${b.sci.replace(/'/g,"\'")}','${b.pop.replace(/'/g,"\'")}');"
+    style="position:relative;border-radius:var(--radius-md);overflow:hidden;cursor:pointer;height:130px;background:var(--sky-light);transition:transform .15s,box-shadow .15s;"
+    onmouseover="this.style.transform='translateY(-3px)';this.style.boxShadow='var(--shadow-md)'"
+    onmouseout="this.style.transform='';this.style.boxShadow=''">
+    <div id="bcard_bg_${safeId}" style="position:absolute;inset:0;background:linear-gradient(135deg,var(--sky),var(--forest));" data-sci="${escHtml(b.sci)}"></div>
+    <div style="position:absolute;inset:0;background:linear-gradient(transparent 30%,rgba(0,0,0,0.75));"></div>
+    <div style="position:absolute;bottom:0;left:0;right:0;padding:8px 10px;">
+      <div style="font-weight:700;font-size:12px;color:white;line-height:1.2;text-shadow:0 1px 4px rgba(0,0,0,0.8);">${capitalize(b.pop)}</div>
+      <div style="font-size:9.5px;color:rgba(255,255,255,0.75);font-style:italic;">${b.sci}</div>
+      <div style="display:flex;gap:3px;margin-top:3px;">
+        ${found  ? '<span style="font-size:9px;background:var(--forest);color:white;border-radius:10px;padding:1px 5px;font-weight:700;">✓</span>' : ''}
+        ${atRisk ? '<span style="font-size:9px;background:rgba(239,68,68,0.8);color:white;border-radius:10px;padding:1px 5px;font-weight:700;">⚠</span>' : ''}
+      </div>
+    </div>
+  </div>`;
+}
+
+function _appendBirdsPage(grid) {
+  const start = _birdsPage * _BIRDS_PER_PAGE;
+  const slice = _birdsCurrentList.slice(start, start + _BIRDS_PER_PAGE);
+  if (!slice.length) return false;
+
+  const frag = document.createDocumentFragment();
+  slice.forEach(b => {
+    const div = document.createElement('div');
+    div.innerHTML = _buildBirdCard(b);
+    frag.appendChild(div.firstElementChild);
+  });
+  grid.appendChild(frag);
+  _birdsPage++;
+
+  // Lazy-load fotos com IntersectionObserver
+  const newBgs = grid.querySelectorAll('[id^="bcard_bg_"]:not([data-observed])');
   if ('IntersectionObserver' in window) {
-    const obs = new IntersectionObserver((entries) => {
+    const photoObs = new IntersectionObserver((entries) => {
       entries.forEach(entry => {
         if (!entry.isIntersecting) return;
-        const el  = entry.target;
-        const sci = el.dataset.sci;
-        if (sci && !el._loaded) {
-          el._loaded = true;
-          getBirdPhoto(sci).then(photo => {
-            if (!photo) return;
-            el.style.cssText = `position:absolute;inset:0;background-image:url(${photo.url});background-size:cover;background-position:center;`;
-          });
-        }
-        obs.unobserve(el);
+        const el = entry.target;
+        if (el._loaded) return;
+        el._loaded = true;
+        getBirdPhoto(el.dataset.sci).then(photo => {
+          if (!photo) return;
+          el.style.cssText = `position:absolute;inset:0;background-image:url(${photo.url});background-size:cover;background-position:center;`;
+        });
+        photoObs.unobserve(el);
       });
-    }, { rootMargin: '100px' });
-    bgEls.forEach(el => obs.observe(el));
-  } else {
-    // Fallback sem observer
-    birds.slice(0, 20).forEach(b => {
-      const safeId = b.sci.replace(/[^a-zA-Z0-9]/g,'_');
-      getBirdPhoto(b.sci).then(photo => {
-        if (!photo) return;
-        const bg = document.getElementById('bcard_bg_'+safeId);
-        if (bg) bg.style.cssText = `position:absolute;inset:0;background-image:url(${photo.url});background-size:cover;background-position:center;`;
-      });
-    });
+    }, { rootMargin: '150px' });
+    newBgs.forEach(el => { el.setAttribute('data-observed','1'); photoObs.observe(el); });
   }
+  return slice.length === _BIRDS_PER_PAGE; // tem mais?
+}
+
+function _setupBirdsScrollObserver(grid) {
+  if (!('IntersectionObserver' in window)) return;
+  const hasMore = _birdsCurrentList.length > _BIRDS_PER_PAGE;
+  if (!hasMore) {
+    // Mostra total sem sentinel de carregamento
+    const done = document.createElement('div');
+    done.id = 'birds-scroll-sentinel';
+    done.style.cssText = 'grid-column:1/-1;height:40px;display:flex;align-items:center;justify-content:center;';
+    done.innerHTML = `<span style="color:var(--text-muted);font-size:12px;">✅ ${_birdsCurrentList.length} espécies carregadas</span>`;
+    grid.appendChild(done);
+    return;
+  }
+
+  // Sentinel inicialmente invisível — só aparece quando o usuário realmente chegou ao fim
+  const sentinel = document.createElement('div');
+  sentinel.id = 'birds-scroll-sentinel';
+  sentinel.style.cssText = 'grid-column:1/-1;height:2px;display:block;';
+  grid.appendChild(sentinel);
+
+  // Loading indicator separado — aparece embaixo do sentinel quando ativado
+  const loader = document.createElement('div');
+  loader.id = 'birds-scroll-loader';
+  loader.style.cssText = 'grid-column:1/-1;height:60px;display:none;align-items:center;justify-content:center;color:var(--text-muted);font-size:13px;';
+  loader.innerHTML = '<span style="animation:spin 1s linear infinite;font-size:22px;">🐦</span><span style="margin-left:8px;">Carregando mais espécies…</span>';
+  grid.appendChild(loader);
+
+  let _loading = false;
+  _birdsScrollObserver = new IntersectionObserver((entries) => {
+    if (!entries[0].isIntersecting || _loading) return;
+    _loading = true;
+    loader.style.display = 'flex';
+    // Pequeno delay para evitar trigger acidental no primeiro render
+    setTimeout(() => {
+      const stillMore = _appendBirdsPage(grid);
+      loader.style.display = 'none';
+      _loading = false;
+      if (!stillMore) {
+        loader.style.display = 'flex';
+        loader.innerHTML = `<span style="color:var(--text-muted);font-size:12px;">✅ ${_birdsCurrentList.length} espécies carregadas</span>`;
+        _birdsScrollObserver.disconnect();
+      }
+    }, 300);
+  }, { rootMargin: '0px', threshold: 0.1 });
+
+  // Aguarda o grid ter altura antes de observar
+  setTimeout(() => _birdsScrollObserver.observe(sentinel), 500);
 }
 
 /* ════════════════════════════════════════
@@ -4502,7 +5200,7 @@ async function openSpeciesModal(sci, pop) {
 
   try {
     const { data, count } = await db.from('observations')
-      .select('id, obs_date, photo_url, profiles(nome,handle)', { count:'exact' })
+      .select('id, obs_date, photo_url, profiles:profiles!observations_user_id_fkey(nome,handle)', { count:'exact' })
       .eq('species_sci', sci).order('created_at',{ascending:false}).limit(20);
     document.getElementById('sp-total').textContent = count ?? 0;
     const uniq = new Set((data||[]).map(o=>o.profiles?.handle).filter(Boolean));
@@ -4514,7 +5212,7 @@ async function openSpeciesModal(sci, pop) {
     if (!photos.length) { gal.innerHTML='<div style="color:var(--text-muted);font-size:12px;padding:8px 0;">Nenhuma foto ainda.</div>'; return; }
     gal.innerHTML = photos.map(o => {
       const h = o.profiles?.handle||'?';
-      const obsObj = { id: o.id, species: capitalize(pop), sciName: sci, photoUrl: o.photo_url, date: o.obs_date, user: { name: o.profiles?.nome||h, handle: h } };
+      const obsObj = { id: o.id, species: capitalize(pop), sciName: sci, photoUrl: o.photo_url, date: o.obs_date, user: { name: o.profiles?.nome||h, handle: h }, companionHandle: o.companion_handle || null };
       return `<div style="border-radius:7px;overflow:hidden;aspect-ratio:1;cursor:pointer;position:relative;" onclick="openPhotoExpand(${JSON.stringify(obsObj).replace(/"/g,'&quot;')})">
         <img src="${o.photo_url}" style="width:100%;height:100%;object-fit:cover;" onerror="this.parentElement.innerHTML='<div style=background:var(--bg);height:100%;display:flex;align-items:center;justify-content:center>🐦</div>'">
         <div style="position:absolute;bottom:0;left:0;right:0;background:linear-gradient(transparent,rgba(0,0,0,0.6));padding:4px 5px;">
@@ -4631,10 +5329,42 @@ async function openPublicProfile(handle) {
         ' style="height:38px;padding:0 16px;border-radius:var(--radius-md);border:1.5px solid var(--border);background:var(--bg);color:var(--text-mid);cursor:pointer;font-size:13px;font-weight:600;">💬 Mensagem</button>';
     }
 
+    // Barra de progresso de amizade no perfil público
+    const pubFriendBar = document.getElementById('pub-friendship-bar');
+    if (pubFriendBar && currentUser && currentUser.id !== profile.id) {
+      try {
+        const { data: fship } = await db.from('friendships')
+          .select('shared_obs, status')
+          .or(`and(requester_id.eq.${currentUser.id},addressee_id.eq.${profile.id}),and(requester_id.eq.${profile.id},addressee_id.eq.${currentUser.id})`)
+          .eq('status', 'accepted')
+          .maybeSingle();
+        if (fship) {
+          const fl = getFriendLevel(fship.shared_obs || 0);
+          const nextLvl = FRIEND_LEVELS[Math.min(fl.lvl + 1, 5)];
+          const pct = fl.lvl >= 5 ? 100 : Math.min(100, ((fship.shared_obs - fl.min) / (nextLvl.min - fl.min)) * 100);
+          pubFriendBar.innerHTML = `<div style="margin-top:12px;padding:10px 14px;background:var(--card);border:1px solid var(--border);border-radius:var(--radius-md);">
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
+              <span style="font-size:11px;font-weight:600;color:var(--text-muted);">🤝 Progresso de amizade</span>
+              <span style="font-size:11px;color:var(--text-muted);">${fl.lvl < 5 ? fship.shared_obs + '/' + nextLvl.min + ' obs juntos' : 'Nível máximo 🌟'}</span>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px;">
+              <span class="obs-rank-badge ${fl.cls}" style="font-size:10px;">${fl.label}</span>
+              <div class="friendship-bar" style="flex:1;"><div class="friendship-fill ${fl.cls}" style="width:${pct}%;"></div></div>
+            </div>
+          </div>`;
+          pubFriendBar.style.display = 'block';
+        } else {
+          pubFriendBar.style.display = 'none';
+        }
+      } catch(e) { pubFriendBar.style.display = 'none'; }
+    } else if (pubFriendBar) {
+      pubFriendBar.style.display = 'none';
+    }
+
     const galleryEl = document.getElementById('pub-gallery-grid');
     if (photos.length) {
       galleryEl.innerHTML = photos.map(o => {
-        const obsObj = { id: o.id, species: o.species_pop, sciName: o.species_sci, photoUrl: o.photo_url, date: o.obs_date, user: { name: profile.nome, handle: profile.handle } };
+        const obsObj = { id: o.id, species: o.species_pop, sciName: o.species_sci, photoUrl: o.photo_url, date: o.obs_date, user: { name: profile.nome, handle: profile.handle }, companionHandle: o.companion_handle || null };
         const safeJson = JSON.stringify(obsObj).replace(/"/g,'&quot;');
         return '<div class="gallery-item" onclick="openPhotoExpand(' + safeJson + ')">'
           + '<img src="' + escHtml(o.photo_url) + '" style="width:100%;height:100%;object-fit:cover;" onerror="this.parentElement.innerHTML=\'&#128038;\'">'
@@ -4818,17 +5548,18 @@ function stopNotifRealtime() {
 ════════════════════════════════════════ */
 async function loadUserStats(userId, handle) {
   try {
+    // Usa select com dados reais em vez de head:true para evitar erros de RLS
     const [obsR, spR, folR] = await Promise.all([
-      db.from('observations').select('id', { count:'exact', head:true }).eq('user_id', userId),
-      db.from('species_seen').select('id',  { count:'exact', head:true }).eq('user_id', userId),
-      db.from('follows').select('follower_id',       { count:'exact', head:true }).eq('following_id', userId)
+      db.from('observations').select('id').eq('user_id', userId).limit(9999),
+      db.from('species_seen').select('species_sci').eq('user_id', userId).limit(9999),
+      db.from('follows').select('follower_id').eq('following_id', userId).limit(9999)
     ]);
     const s = document.getElementById('usp_'+handle);
     const o = document.getElementById('uob_'+handle);
     const f = document.getElementById('ufo_'+handle);
-    if (s) s.textContent = spR.count  ?? 0;
-    if (o) o.textContent = obsR.count ?? 0;
-    if (f) f.textContent = folR.count ?? 0;
+    if (s) s.textContent = (spR.data?.length) ?? 0;
+    if (o) o.textContent = (obsR.data?.length) ?? 0;
+    if (f) f.textContent = (folR.data?.length) ?? 0;
   } catch(e) {}
 }
 
