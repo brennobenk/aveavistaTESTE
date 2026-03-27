@@ -5,11 +5,13 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Ave à Vista</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Sans:wght@300;400;500;600&family=DM+Mono&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,500;0,600;0,700;1,400;1,600&family=Nunito:wght@300;400;500;600;700;800&family=DM+Mono&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="style.css">
 
 <!-- ══ SUPABASE ══ -->
-<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+<!-- Supabase UMD pinned — evita "Unexpected token export" -->
+<!-- Supabase UMD — unpkg, versão fixada, sem ESM -->
+<script src="https://unpkg.com/@supabase/supabase-js@2.39.3/dist/umd/supabase.js"></script>
 <script src="main.js" defer></script>
 </head>
 <body>
@@ -24,7 +26,8 @@
     <button class="sidebar-toggle" id="sidebar-toggle" title="Menu">☰</button>
 
     <div class="sidebar-logo-row">
-      <div class="sidebar-logo">🦜</div>
+      <img src="logo.png" alt="Ave à Vista" class="sidebar-logo-img" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">
+      <div class="sidebar-logo" style="display:none">🦜</div>
       <span class="sidebar-logo-label">Ave à Vista</span>
     </div>
 
@@ -77,7 +80,8 @@
   <!-- TOPBAR -->
   <header class="topbar">
     <div class="topbar-title" onclick="navigateTo('home', document.querySelector('[data-page=home]'))" style="cursor:pointer;" title="Ir para o início">
-      <div class="tb-logo-icon">🦜</div>
+      <img src="logo.png" alt="Ave à Vista" class="tb-logo-img" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">
+      <div class="tb-logo-icon" style="display:none">🦜</div>
       <span>Ave à Vista</span>
     </div>
     <div class="topbar-search" id="topbar-search-wrap">
@@ -256,6 +260,7 @@
           <div style="font-size:11px;color:var(--text-muted);margin-top:4px;">Apenas 1 companheiro por registro. O companheiro receberá uma solicitação — se aceitar, ambos ganham pontos de amizade</div>
         </div>
 
+        <!-- 🌿 Publicar no iNaturalist — desabilitado temporariamente
         <label class="inat-toggle" id="inat-toggle">
           <input type="checkbox" id="inat-publish" checked>
           <div class="inat-toggle-text">
@@ -263,10 +268,16 @@
             <span style="font-size:12px;color:var(--text-muted);">Sua observação contribui para o banco de dados global de biodiversidade</span>
           </div>
         </label>
+        -->
 
-        <button class="btn-submit-upload" id="btn-submit" onclick="submitObservation()">
-          📤 Enviar Avistamento
-        </button>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+          <button class="btn-submit-upload" id="btn-submit" onclick="submitObservation()" style="flex:1;min-width:160px;">
+            📤 Enviar Avistamento
+          </button>
+          <button onclick="addToQueue()" style="flex:1;min-width:140px;height:44px;border:1.5px solid var(--sky);border-radius:var(--radius-md);background:var(--bg);color:var(--sky);font-weight:700;font-size:13px;cursor:pointer;" title="Adiciona à fila para enviar vários de uma vez">
+            ➕ Adicionar à Fila
+          </button>
+        </div>
       </div>
     </section>
 
@@ -390,6 +401,7 @@
           <div id="pub-avatar" style="width:88px;height:88px;border-radius:50%;border:3px solid var(--card);background:linear-gradient(135deg,var(--sky),var(--forest));display:flex;align-items:center;justify-content:center;font-size:32px;color:white;font-weight:700;overflow:hidden;box-shadow:var(--shadow-md);">?</div>
         </div>
         <div style="padding-top:14px;display:flex;justify-content:flex-end;gap:8px;" id="pub-action-row"></div>
+        <div id="pub-friendship-bar" style="display:none;"></div>
         <div style="padding-top:10px;">
           <div id="pub-name" style="font-family:'Syne',sans-serif;font-size:22px;font-weight:800;color:var(--text);">Carregando...</div>
           <div id="pub-handle" style="font-size:13px;color:var(--sky);margin-bottom:3px;"></div>
@@ -402,6 +414,7 @@
             <div class="profile-stat"><div class="profile-stat-num" id="pub-stat-obs">—</div><div class="profile-stat-label">Avistamentos</div></div>
             <div class="profile-stat"><div class="profile-stat-num" id="pub-stat-photos">—</div><div class="profile-stat-label">Fotos</div></div>
             <div class="profile-stat"><div class="profile-stat-num" id="pub-stat-days">—</div><div class="profile-stat-label">Dias em campo</div></div>
+            <div class="profile-stat"><div class="profile-stat-num" id="pub-stat-points">—</div><div class="profile-stat-label">Pts Indicadoras</div></div>
           </div>
         </div>
       </div>
@@ -719,9 +732,9 @@
 <div class="celebration-overlay" id="celebration" onclick="this.classList.remove('show')">
   <div class="celebration-box" onclick="event.stopPropagation()">
     <div class="celebration-emoji">🎉</div>
-    <div class="celebration-title">Ave registrada!</div>
+    <h2 class="celebration-title" style="margin:0 0 6px;">Ave registrada!</h2>
     <div class="celebration-sub" id="celebration-sub">Você encontrou mais uma espécie!</div>
-    <button onclick="document.getElementById('celebration').classList.remove('show')" style="margin-top:14px;background:var(--forest);border:none;border-radius:20px;color:white;padding:6px 20px;font-size:13px;font-weight:600;cursor:pointer;">OK 🎉</button>
+    <button onclick="document.getElementById('celebration').classList.remove('show')" style="margin-top:14px;background:var(--cel-color,var(--forest));border:none;border-radius:20px;color:white;padding:6px 20px;font-size:13px;font-weight:600;cursor:pointer;">OK 🎉</button>
   </div>
 </div>
 
@@ -1031,7 +1044,7 @@
       <h3>11. DISPOSIÇÕES FINAIS</h3>
       <p>Se qualquer disposição deste Termo for considerada inválida ou inexequível, as demais permanecerão em pleno vigor.</p>
       <h3>12. DOS REGISTROS E PUBLICAÇÕES – CONDIÇÕES ÉTICAS E AMBIENTAIS</h3>
-      <p>O compromisso do Ave A Vista! com a observação responsável da avifauna silvestre é inegociável. Dessa forma, ao realizar qualquer registro ou publicação na plataforma, o usuário declara, sob sua exclusiva responsabilidade, que: a) Toda publicação deve conter, no mínimo, a indicação do município de ocorrência, sendo este dado essencial para a contabilização da espécie e para a validade do registro científico e estatístico no âmbito da plataforma; b) A ave registrada encontra-se em estado de vida livre, não estando sob nenhuma condição de cativeiro, ainda que autorizado, nem em situação de ferimento, contenção, abuso ou qualquer forma de privação de liberdade, exceto quando se tratar de registro vinculado a instituição devidamente identificada e que comprove tratar-se de coleta ou captura para fins de salvamento ou pesquisa científica, conforme procedimento descrito no item “d” abaixo; c) Nenhuma prática de caça, captura, coleta, perseguição ou qualquer ato que possa causar dano, estresse ou morte ao animal foi realizada para a obtenção do registro fotográfico ou da observação, salvo a hipótese de exceção prevista na alínea anterior; d) Registros que envolvam coleta ou captura institucional ou científica somente serão admitidos se o usuário enviar previamente um e-mail para brennobenk@hotmail.com, contendo explicação detalhada e documentos comprobatórios da autorização institucional ou científica (como licença ambiental, autorização do órgão competente, vinculação a projeto de pesquisa ou ação de salvamento). A validação do registro fica condicionada à análise e aprovação pela equipe do Ave A Vista!. Enquanto não houver essa validação prévia, o registro poderá ser removido e sujeito às medidas previstas neste Termo; e) O registro é fruto de observação ética, respeitando-se o distanciamento adequado, o bem-estar do animal e as normas ambientais vigentes.</p>
+      <p>O compromisso do Ave A Vista! com a observação responsável da avifauna silvestre é inegociável. Dessa forma, ao realizar qualquer registro ou publicação na plataforma, o usuário declara, sob sua exclusiva responsabilidade, que: a) Toda publicação deve conter, no mínimo, a indicação do município de ocorrência, sendo este dado essencial para a contabilização da espécie e para a validade do registro científico e estatístico no âmbito da plataforma; b) A ave registrada encontra-se em estado de vida livre, não estando sob nenhuma condição de cativeiro, ainda que autorizado, nem em situação de ferimento, contenção, abuso ou qualquer forma de privação de liberdade, exceto quando se tratar de registro vinculado a instituição devidamente identificada e que comprove tratar-se de coleta ou captura para fins de salvamento ou pesquisa científica, conforme procedimento descrito no item “d” abaixo; c) Nenhuma prática de caça, captura, coleta, perseguição ou qualquer ato que possa causar dano, estresse ou morte ao animal foi realizada para a obtenção do registro fotográfico ou da observação, salvo a hipótese de exceção prevista na alínea anterior; d) Registros que envolvam coleta ou captura institucional ou científica somente serão admitidos se o usuário enviar previamente um e-mail para <a href="/cdn-cgi/l/email-protection" class="__cf_email__" data-cfemail="afcdddcac1c1c0cdcac1c4efc7c0dbc2cec6c381ccc0c2">[email&#160;protected]</a>, contendo explicação detalhada e documentos comprobatórios da autorização institucional ou científica (como licença ambiental, autorização do órgão competente, vinculação a projeto de pesquisa ou ação de salvamento). A validação do registro fica condicionada à análise e aprovação pela equipe do Ave A Vista!. Enquanto não houver essa validação prévia, o registro poderá ser removido e sujeito às medidas previstas neste Termo; e) O registro é fruto de observação ética, respeitando-se o distanciamento adequado, o bem-estar do animal e as normas ambientais vigentes.</p>
       <p>O usuário reconhece que aves silvestres não existem para serem mantidas em gaiolas ou sob confinamento, comprometendo-se a utilizar a plataforma como ferramenta para desnormalizar essa prática, promovendo a valorização da avifauna em seu ambiente natural.</p>
       <p>O descumprimento de qualquer das normas previstas neste item sujeitará o usuário às seguintes medidas, sem prejuízo de outras cabíveis: Remoção imediata da publicação ou do registro irregular; Advertência ou suspensão da conta do usuário, a critério do Ave A Vista!; Denúncia aos órgãos competentes, em especial à Polícia Militar Ambiental ou ao órgão de proteção animal local, sempre que a conduta configurar infração administrativa, civil ou penal, conforme a legislação aplicável.</p>
       <p>Ao clicar em “Concordo”, cadastrar-se ou continuar utilizando o site, o usuário declara que leu, entendeu e aceita todos os termos acima.</p>
@@ -1056,10 +1069,4 @@
   <button class="bottom-nav-btn" data-page="users" onclick="navigateTo('users',this);syncBottomNav(this)">
     <span class="bn-icon">🔍</span><span>Buscar</span>
   </button>
-  <button class="bottom-nav-btn" data-page="profile" onclick="navigateTo('profile',this);syncBottomNav(this)">
-    <span class="bn-icon">👤</span><span>Perfil</span>
-  </button>
-</nav>
-</div>
-</body>
-</html>
+  <button class="bottom-nav-btn" data-page="profile" onclick="navigateTo('profile',this);s
